@@ -10,11 +10,11 @@
 #####    CONFIG    ##################################################################################################
 configDir="$HOME/.config/solana" # the directory for the config files, eg.: /home/user/.config/solana
 ##### optional:        #
-identityPubkey=""      # identity pubkey for the validator, insert if autodiscovery fails
-voteAccount=""         # vote account address for the validator, specify if there are more than one or if autodiscovery fails
+identityPubkey="4QNekaDqrLmUENqkVhGCJrgHziPxkX9kridbKwunx9su"      # identity pubkey for the validator, insert if autodiscovery fails
+voteAccount="GNZ1PAAS33davY4Q1BMEpZEpVBtRtGvSpcTH5wYVkkVt"         # vote account address for the validator, specify if there are more than one or if autodisco>
 additionalInfo="on"    # set to 'on' for additional general metrics like balance on your vote and identity accounts, number of validator nodes, epoch number and percentage epoch elapsed
-binDir=""              # auto detection of the solana binary directory can fail or an alternative custom installation is preferred, in case insert like $HOME/solana/target/release
-rpcURL=""              # default is localhost with port number autodiscovered, alternatively it can be specified like http://custom.rpc.com:port
+binDir="/home/solana/.local/share/solana/install/active_release/bin"              # auto detection of the solana binary directory can fail or an alternative custom installation is preferred, in case insert like $HOME/solana/target/release
+rpcURL="http://localhost:8899"              # default is localhost with port number autodiscovered, alternatively it can be specified like http://custom.rpc.com:port
 format="SOL"           # amounts shown in 'SOL' instead of lamports
 now=$(date +%s%N)      # date in influx format
 timezone="UTC"            # time zone for epoch ends metric
@@ -38,7 +38,6 @@ noVoting=$(ps aux | grep agave-validator | grep -c "\-\-no\-voting")
 if [ "$noVoting" -eq 0 ]; then
    if [ -z $identityPubkey ]; then identityPubkey=$($cli address --url $rpcURL); fi
    if [ -z $identityPubkey ]; then echo "auto-detection failed, please configure the identityPubkey in the script if not done"; exit 1; fi
-   if [ -z $voteAccount ]; then voteAccount=$($cli validators --url $rpcURL --output json-compact | jq -r 'first (.validators[] | select(.identityPubkey == '\"$identityPubkey\"')) | .voteAccountPubkey'); fi
    if [ -z $voteAccount ]; then echo "please configure the vote account in the script or wait for availability upon starting the node"; exit 1; fi
 fi
 
@@ -46,14 +45,64 @@ validatorBalance=$($cli balance $identityPubkey --url $rpcURL | grep -o '[0-9.]*
 validatorVoteBalance=$($cli balance $voteAccount --url $rpcURL | grep -o '[0-9.]*')
 solanaPrice=$(curl -s 'GET' 'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd' -H 'accept: application/json' | jq -r .solana.usd)
 openfiles=$(cat /proc/sys/fs/file-nr | awk '{ print $1 }')
-validatorCheck=$($cli validators --url $rpcURL)
+validatorCheck=$(curl -s "$rpcURL" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getVoteAccounts"}')
 
-if [ $(grep -c $voteAccount <<< $validatorCheck) == 0  ]; then echo "validator not found in set"; exit 1; fi
-    blockProduction=$($cli block-production --url $rpcURL --output json-compact 2>&- | grep -v Note:)
-    validatorBlockProduction=$(jq -r '.leaders[] | select(.identityPubkey == '\"$identityPubkey\"')' <<<$blockProduction)
-    validators=$($cli validators --url $rpcURL --output json-compact 2>&-)
-    currentValidatorInfo=$(jq -r '.validators[] | select(.voteAccountPubkey == '\"$voteAccount\"')' <<<$validators)
-    delinquentValidatorInfo=$(jq -r '.validators[] | select(.voteAccountPubkey == '\"$voteAccount\"' and .delinquent == true)' <<<$validators)
+if ! jq -e '.result' >/dev/null 2>&1 <<<"$validatorCheck"; then
+    echo "getVoteAccounts RPC failed"
+    echo "nodemonitor,pubkey=$identityPubkey status=2 $now"
+    exit 1
+fi
+
+validators=$(jq -c '
+  .result as $r |
+  {
+    validators:
+      (
+        ($r.current // [] | map(. + {delinquent:false})) +
+        ($r.delinquent // [] | map(. + {delinquent:true}))
+      | map({
+          identityPubkey: .nodePubkey,
+          voteAccountPubkey: .votePubkey,
+          rootSlot: (.rootSlot // 0),
+          lastVote: (.lastVote // 0),
+          credits: (.epochCredits[-1][1] // 0),
+          activatedStake: (.activatedStake // 0),
+          commission: (.commission // 0),
+          version: "unknown",
+          delinquent: .delinquent
+        })
+      ),
+    totalActiveStake:
+      ((($r.current // []) + ($r.delinquent // [])) | map(.activatedStake // 0) | add // 0),
+    totalCurrentStake:
+      (($r.current // []) | map(.activatedStake // 0) | add // 0),
+    totalDelinquentStake:
+      (($r.delinquent // []) | map(.activatedStake // 0) | add // 0),
+    stakeByVersion: {}
+  }' <<<"$validatorCheck")
+
+if [ $(jq -r --arg voteAccount "$voteAccount" \
+  '[.validators[] | select(.voteAccountPubkey == $voteAccount)] | length' \
+  <<<"$validators") == 0 ]; then
+    echo "validator not found in set"
+    exit 1
+fi
+
+blockProduction=$($cli block-production --url $rpcURL --output json-compact 2>&- | grep -v Note:)
+
+validatorBlockProduction=$(jq -r \
+  '.leaders[] | select(.identityPubkey == "'"$identityPubkey"'")' \
+  <<<$blockProduction)
+
+currentValidatorInfo=$(jq -r \
+  '.validators[] | select(.voteAccountPubkey == "'"$voteAccount"'" and .delinquent == false)' \
+  <<<$validators)
+
+delinquentValidatorInfo=$(jq -r \
+  '.validators[] | select(.voteAccountPubkey == "'"$voteAccount"'" and .delinquent == true)' \
+  <<<$validators)
     if [[ ((-n "$currentValidatorInfo" || "$delinquentValidatorInfo" ))  ]] || [[ ("$validatorBlockTimeTest" -eq "1" ) ]]; then
         status=1 #status 0=validating 1=up 2=error 3=delinquent 4=stopped
         blockHeight=$(jq -r '.slot' <<<$validatorBlockTime)
@@ -64,16 +113,24 @@ if [ $(grep -c $voteAccount <<< $validatorCheck) == 0  ]; then echo "validator n
               activatedStake=$(jq -r '.activatedStake' <<<$delinquentValidatorInfo)
         if [ "$format" == "SOL" ]; then activatedStake=$(echo "scale=2 ; $activatedStake / 1000000000.0" | bc); fi
               credits=$(jq -r '.credits' <<<$delinquentValidatorInfo)
-              version=$(jq -r '.version' <<<$delinquentValidatorInfo | sed 's/ /-/g')
+              # Set version to 0 if unknown, null, or invalid
+              version=$(jq -r '.version | if (. == "unknown" or . == null) then "0" else . end' <<<$delinquentValidatorInfo | sed 's/ /-/g' || echo "0")
               version2=${version//./}
+              version2=${version2:-0} # Ensure numeric
+              # version=$(jq -r '.version' <<<$delinquentValidatorInfo | sed 's/ /-/g')
+              # version2=${version//./}
               commission=$(jq -r '.commission' <<<$delinquentValidatorInfo)
               logentry="rootSlot=$(jq -r '.rootSlot' <<<$delinquentValidatorInfo),lastVote=$(jq -r '.lastVote' <<<$delinquentValidatorInfo),credits=$credits,activatedStake=$activatedStake,version=$version2,commission=$commission"
         elif [ -n "$currentValidatorInfo" ]; then
               status=0
               activatedStake=$(jq -r '.activatedStake' <<<$currentValidatorInfo)
               credits=$(jq -r '.credits' <<<$currentValidatorInfo)
-              version=$(jq -r '.version' <<<$currentValidatorInfo | sed 's/ /-/g')
+              # Set version to 0 if unknown, null, or invalid
+              version=$(jq -r '.version | if (. == "unknown" or . == null) then "0" else . end' <<<$currentValidatorInfo | sed 's/ /-/g' || echo "0")
               version2=${version//./}
+              version2=${version2:-0} # Ensure numeric
+              # version=$(jq -r '.version' <<<$currentValidatorInfo | sed 's/ /-/g')
+              # version2=${version//./}
               commission=$(jq -r '.commission' <<<$currentValidatorInfo)
               logentry="rootSlot=$(jq -r '.rootSlot' <<<$currentValidatorInfo),lastVote=$(jq -r '.lastVote' <<<$currentValidatorInfo)"
               leaderSlots=$(jq -r '.leaderSlots' <<<$validatorBlockProduction)
@@ -116,7 +173,6 @@ if [ $(grep -c $voteAccount <<< $validatorCheck) == 0  ]; then echo "validator n
            VAR2=$(echo $TIME | grep -oE '[0-9]+h'   | grep -o -E '[0-9]+')
            VAR3=$(echo $TIME | grep -oE '[0-9]+m'   | grep -o -E '[0-9]+')
            VAR4=$(echo $TIME | grep -oE '[0-9]+s'   | grep -o -E '[0-9]+')
-           
            if [ -z "$VAR1" ];
            then
            VAR1=0
@@ -136,7 +192,6 @@ if [ $(grep -c $voteAccount <<< $validatorCheck) == 0  ]; then echo "validator n
            then
            VAR4=0
            fi
-           
            epochEnds=$(TZ=$timezone date -d "$VAR1 days $VAR2 hours $VAR3 minutes $VAR4 seconds" +"%m/%d/%Y %H:%M")
            epochEnds=$(( $(TZ=$timezone date -d "$epochEnds" +%s) * 1000 ))
            voteElapsed=$(echo "scale=4; $pctEpochElapsed / 100 * 432000" | bc)
