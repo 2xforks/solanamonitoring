@@ -103,6 +103,23 @@ currentValidatorInfo=$(jq -r \
 delinquentValidatorInfo=$(jq -r \
   '.validators[] | select(.voteAccountPubkey == "'"$voteAccount"'" and .delinquent == true)' \
   <<<$validators)
+
+detectedVersion=$($cli gossip --url "$rpcURL" 2>/dev/null | \
+  awk -F'|' -v id="$identityPubkey" '
+    $2 ~ id {
+      gsub(/^[ \t]+|[ \t]+$/, "", $7)
+      print $7
+      exit
+    }')
+
+if [ -n "$detectedVersion" ]; then
+  if [ -n "$currentValidatorInfo" ]; then
+    currentValidatorInfo=$(jq --arg v "$detectedVersion" '.version=$v' <<<"$currentValidatorInfo")
+  fi
+  if [ -n "$delinquentValidatorInfo" ]; then
+    delinquentValidatorInfo=$(jq --arg v "$detectedVersion" '.version=$v' <<<"$delinquentValidatorInfo")
+  fi
+fi
     if [[ ((-n "$currentValidatorInfo" || "$delinquentValidatorInfo" ))  ]] || [[ ("$validatorBlockTimeTest" -eq "1" ) ]]; then
         status=1 #status 0=validating 1=up 2=error 3=delinquent 4=stopped
         blockHeight=$(jq -r '.slot' <<<$validatorBlockTime)
@@ -114,11 +131,9 @@ delinquentValidatorInfo=$(jq -r \
         if [ "$format" == "SOL" ]; then activatedStake=$(echo "scale=2 ; $activatedStake / 1000000000.0" | bc); fi
               credits=$(jq -r '.credits' <<<$delinquentValidatorInfo)
               # Set version to 0 if unknown, null, or invalid
-              version=$(jq -r '.version | if (. == "unknown" or . == null) then "0" else . end' <<<$delinquentValidatorInfo | sed 's/ /-/g' || echo "0")
-              version2=${version//./}
-              version2=${version2:-0} # Ensure numeric
-              # version=$(jq -r '.version' <<<$delinquentValidatorInfo | sed 's/ /-/g')
-              # version2=${version//./}
+              version=$(jq -r '.version // "unknown"' <<<$currentValidatorInfo | sed 's/ /-/g')
+              version2=$(echo "$version" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' | tr -d '.')
+              version2=${version2:-0}
               commission=$(jq -r '.commission' <<<$delinquentValidatorInfo)
               logentry="rootSlot=$(jq -r '.rootSlot' <<<$delinquentValidatorInfo),lastVote=$(jq -r '.lastVote' <<<$delinquentValidatorInfo),credits=$credits,activatedStake=$activatedStake,version=$version2,commission=$commission"
         elif [ -n "$currentValidatorInfo" ]; then
@@ -126,11 +141,9 @@ delinquentValidatorInfo=$(jq -r \
               activatedStake=$(jq -r '.activatedStake' <<<$currentValidatorInfo)
               credits=$(jq -r '.credits' <<<$currentValidatorInfo)
               # Set version to 0 if unknown, null, or invalid
-              version=$(jq -r '.version | if (. == "unknown" or . == null) then "0" else . end' <<<$currentValidatorInfo | sed 's/ /-/g' || echo "0")
-              version2=${version//./}
-              version2=${version2:-0} # Ensure numeric
-              # version=$(jq -r '.version' <<<$currentValidatorInfo | sed 's/ /-/g')
-              # version2=${version//./}
+              version=$(jq -r '.version // "unknown"' <<<$currentValidatorInfo | sed 's/ /-/g')
+              version2=$(echo "$version" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' | tr -d '.')
+              version2=${version2:-0}
               commission=$(jq -r '.commission' <<<$currentValidatorInfo)
               logentry="rootSlot=$(jq -r '.rootSlot' <<<$currentValidatorInfo),lastVote=$(jq -r '.lastVote' <<<$currentValidatorInfo)"
               leaderSlots=$(jq -r '.leaderSlots' <<<$validatorBlockProduction)
@@ -149,15 +162,10 @@ delinquentValidatorInfo=$(jq -r \
               totalActiveStake=$(jq -r '.totalActiveStake' <<<$validators)
               totalDelinquentStake=$(jq -r '.totalDelinquentStake' <<<$validators)
               pctTotDelinquent=$(echo "scale=2 ; 100 * $totalDelinquentStake / $totalActiveStake" | bc)
-              versionActiveStake=$(jq -r '.stakeByVersion.'\"$version\"'.currentActiveStake' <<<$validators)
-              stakeByVersion=$(jq -r '.stakeByVersion' <<<$validators)
-              stakeByVersion=$(jq -r 'to_entries | map_values(.value + { version: .key })' <<<$stakeByVersion)
-              nextVersionIndex=$(expr $(jq -r 'map(.version == '\"$version\"') | index(true)' <<<$stakeByVersion) + 1)
-              stakeByVersion=$(jq '.['$nextVersionIndex':]' <<<$stakeByVersion)
-              stakeNewerVersions=$(jq -s 'map(.[].currentActiveStake) | add' <<<$stakeByVersion)
-              totalCurrentStake=$(jq -r '.totalCurrentStake' <<<$validators)
-              pctVersionActive=$(echo "scale=2 ; 100 * $versionActiveStake / $totalCurrentStake" | bc)
-              pctNewerVersions=$(echo "scale=2 ; 100 * $stakeNewerVersions / $totalCurrentStake" | bc)
+              versionActiveStake=0
+              totalCurrentStake=$(jq -r '.totalCurrentStake // 0' <<<$validators)
+              pctVersionActive=0
+              pctNewerVersions=0
               logentry="$logentry,leaderSlots=$leaderSlots,skippedSlots=$skippedSlots,pctSkipped=$pctSkipped,pctTotSkipped=$pctTotSkipped,pctSkippedDelta=$pctSkippedDelta,pctTotDelinquent=$pctTotDelinquent"
               logentry="$logentry,version=$version2,pctNewerVersions=$pctNewerVersions,commission=$commission,activatedStake=$activatedStake,credits=$credits,solanaPrice=$solanaPrice"
            else status=2; fi
